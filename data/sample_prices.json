@@ -1,0 +1,26 @@
+[
+  {
+    "mandi": "Kolar",
+    "crop": "tomato",
+    "price_per_kg": 18.0,
+    "currency": "INR",
+    "source": "illustrative_sample",
+    "updated_at": null
+  },
+  {
+    "mandi": "Chikkaballapur",
+    "crop": "tomato",
+    "price_per_kg": 20.0,
+    "currency": "INR",
+    "source": "illustrative_sample",
+    "updated_at": null
+  },
+  {
+    "mandi": "Bengaluru",
+    "crop": "tomato",
+    "price_per_kg": 22.0,
+    "currency": "INR",
+    "source": "illustrative_sample",
+    "updated_at": null
+  }
+]
