@@ -230,6 +230,7 @@ def calculate_transport(
 
         result = {
             "mandi": name,
+            "market_id": destination.get("market_id"),
             "origin": origin.get("name", "Farmer location"),
             "quantity_quintals": quantity,
             "trucks_needed": trucks_needed,
