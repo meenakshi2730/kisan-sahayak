@@ -2,6 +2,7 @@
 import asyncio
 import contextlib
 import json
+import math
 import os
 import re
 import sys
@@ -32,7 +33,8 @@ ASI_ONE_API_KEY = os.getenv("ASI_ONE_API_KEY", "").strip()
 
 ASI_ONE_URL = "https://api.asi1.ai/v1/chat/completions"
 
-SUPPORTED_CROPS = {"tomato", "onion", "potato"}
+# Kisan Sahayak supports tomato farming only.
+SUPPORTED_CROPS = {"tomato"}
 
 # Use an explicitly managed loop for the local agent.
 loop = None
@@ -72,7 +74,7 @@ async def reply(ctx: Context, recipient: str, text: str) -> None:
 
 
 def extract_farmer_request(message: str) -> dict:
-    """Extract and validate a farmer's selling request using ASI:One."""
+    """Extract and validate a tomato-selling request using ASI:One."""
 
     if not ASI_ONE_API_KEY or ASI_ONE_API_KEY.startswith("PASTE_"):
         raise RuntimeError(
@@ -92,11 +94,15 @@ def extract_farmer_request(message: str) -> dict:
                 {
                     "role": "system",
                     "content": (
-                        "Extract a farmer's mandi-selling request. "
-                        "Return only a JSON object with keys crop, "
-                        "location, quantity_quintals. Use null for "
-                        "missing values. quantity_quintals must be numeric. "
-                        "Do not invent prices or recommendations."
+                        "You extract structured information from requests "
+                        "made by tomato farmers who want to sell tomatoes. "
+                        "Return only one valid JSON object with exactly "
+                        "these keys: crop, location, quantity_quintals. "
+                        "Use null when information is missing. "
+                        "The crop must reflect what the user actually "
+                        "mentioned; never assume a missing crop is tomato. "
+                        "Use a numeric value for quantity_quintals. "
+                        "Do not invent prices, weather, or recommendations."
                     ),
                 },
                 {"role": "user", "content": message},
@@ -113,19 +119,23 @@ def extract_farmer_request(message: str) -> dict:
         raise ValueError("ASI:One returned an unexpected response.")
 
     content = content.strip()
+
+    # Support JSON enclosed in Markdown code fences.
     content = re.sub(
-        r"^```(?:json)?\s*",
+        r"^\s*```(?:json)?\s*",
         "",
         content,
         flags=re.IGNORECASE,
     )
-    content = re.sub(r"\s*```$", "", content)
+    content = re.sub(r"\s*```\s*$", "", content)
 
-    # Extract the JSON object from the response.
+    # Extract the JSON object.
     match = re.search(r"\{.*\}", content, re.DOTALL)
 
     if not match:
-        raise ValueError("ASI:One did not return a valid JSON object.")
+        raise ValueError(
+            "ASI:One did not return a valid JSON object."
+        )
 
     result = json.loads(match.group(0))
 
@@ -137,26 +147,42 @@ def extract_farmer_request(message: str) -> dict:
     quantity = result.get("quantity_quintals")
 
     if not isinstance(crop, str) or not crop.strip():
-        raise ValueError("Please specify your crop.")
+        raise ValueError(
+            "Please specify the crop. Kisan Sahayak currently supports "
+            "tomato farming only."
+        )
 
-    if not isinstance(location, str) or not location.strip():
-        raise ValueError("Please specify your location.")
-
+    # Normalize common tomato naming variations.
     crop = crop.strip().lower()
+
+    if crop in {"tomatoes", "tomato"}:
+        crop = "tomato"
 
     if crop not in SUPPORTED_CROPS:
         raise ValueError(
-            "For this demo, supported crops are tomato, onion and potato."
+            "Kisan Sahayak currently supports tomato farming only. "
+            "Please submit a request about tomatoes."
         )
 
-    if isinstance(quantity, bool) or not isinstance(quantity, (int, float)):
-        raise ValueError("Please specify the quantity in quintals.")
+    if not isinstance(location, str) or not location.strip():
+        raise ValueError(
+            "Please specify your location so your tomato-selling "
+            "request can be processed."
+        )
+
+    if isinstance(quantity, bool) or not isinstance(
+        quantity, (int, float)
+    ):
+        raise ValueError(
+            "Please specify the quantity of tomatoes in quintals."
+        )
 
     quantity = float(quantity)
 
-    if not 0 < quantity <= 100000:
+    if not math.isfinite(quantity) or not 0 < quantity <= 100000:
         raise ValueError(
-            "Quantity must be greater than zero and at most 100000 quintals."
+            "Quantity must be greater than zero and at most "
+            "100000 quintals."
         )
 
     return {
@@ -195,13 +221,17 @@ async def handle_farmer_message(
             await reply(
                 ctx,
                 sender,
-                "KISAN SAHAYAK — REQUEST RECEIVED\n\n"
-                f"Crop: {request['crop']}\n"
-                f"Quantity: {request['quantity_quintals']} quintals\n"
+                "KISAN SAHAYAK - TOMATO FARMING ASSISTANT\n\n"
+                f"Crop: {request['crop'].title()}\n"
+                f"Quantity: {request['quantity_quintals']:g} quintals\n"
                 f"Location: {request['location']}\n\n"
-                "Your request has been understood. The next integration "
-                "step is to connect the Mandi Price, Transport and Weather "
-                "agents before producing a market recommendation.",
+                "Your tomato-selling request has been received and "
+                "validated.\n\n"
+                "This version extracts and validates your request. "
+                "Live tomato mandi prices, transport estimates and "
+                "weather information are not yet retrieved by this "
+                "handler. Those agents must be integrated and tested "
+                "before a market recommendation can be provided.",
             )
 
         except requests.RequestException:
@@ -209,7 +239,8 @@ async def handle_farmer_message(
             await reply(
                 ctx,
                 sender,
-                "ASI:One is temporarily unavailable. Please try again later.",
+                "ASI:One is temporarily unavailable. "
+                "Please try again later.",
             )
 
         except (KeyError, TypeError, json.JSONDecodeError):
@@ -217,8 +248,8 @@ async def handle_farmer_message(
             await reply(
                 ctx,
                 sender,
-                "I couldn't process that request. Please specify your "
-                "crop, quantity in quintals and location.",
+                "I couldn't process that request. Please specify "
+                "tomato, the quantity in quintals and your location.",
             )
 
         except (ValueError, RuntimeError) as exc:
@@ -248,7 +279,6 @@ if __name__ == "__main__" and not HOSTED:
     print("Starting Kisan Sahayak orchestrator...")
 
     try:
-        # Keep the same event loop alive for the agent's lifetime.
         loop.create_task(agent.run_async())
         loop.run_forever()
 
@@ -266,7 +296,6 @@ if __name__ == "__main__" and not HOSTED:
                 asyncio.gather(*pending, return_exceptions=True)
             )
 
-        # Allow pending network transports to finish closing.
         with contextlib.suppress(Exception):
             loop.run_until_complete(asyncio.sleep(0.25))
 
