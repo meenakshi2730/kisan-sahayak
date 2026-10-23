@@ -519,7 +519,7 @@ def process_weather_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
 def format_farmer_report(result: Dict[str, Any]) -> str:
     """Render a farmer-friendly report instead of raw JSON in the chat."""
     if result.get("status") != "success":
-        return f"❌ Unable to generate advice\n\n{result.get('message', 'Unknown error')}"
+        return f" Unable to generate advice\n\n{result.get('message', 'Unknown error')}"
 
     location = result.get("location", "Bengaluru")
     weather = result.get("current_weather", {})
@@ -547,16 +547,16 @@ def format_farmer_report(result: Dict[str, Any]) -> str:
     humid = isinstance(weather.get("humidity_percent"), (int, float)) and weather["humidity_percent"] >= 80
 
     if harvested and ready and (high_rain or (hot and humid) or risk_level == "HIGH"):
-        decision = "🟡 CONSIDER SELLING SOON — especially before forecast rain, if the tomatoes are healthy and market arrangements are ready."
+        decision = " CONSIDER SELLING SOON — especially before forecast rain, if the tomatoes are healthy and market arrangements are ready."
         sale_window = "Consider a sale within the next 24 hours if practical, after checking tomato condition, market arrangements and the latest forecast. This is not a spoilage deadline."
     elif harvested and ready:
-        decision = "🟡 PLAN SALE — check tomato condition and local market arrangements before deciding the timing."
+        decision = "PLAN SALE — check tomato condition and local market arrangements before deciding the timing."
         sale_window = "Choose a suitable nearby sale window after checking the latest forecast and market conditions."
     elif harvested:
-        decision = "🟡 INSPECT FIRST — sort tomatoes by ripeness and condition before deciding what is ready to sell."
+        decision = " INSPECT FIRST — sort tomatoes by ripeness and condition before deciding what is ready to sell."
         sale_window = "Decide after checking ripeness, visible damage and market arrangements."
     else:
-        decision = "🟡 PLAN HARVEST — use tomato maturity and field conditions to decide when to harvest."
+        decision = " PLAN HARVEST — use tomato maturity and field conditions to decide when to harvest."
         sale_window = "No fixed sale window can be recommended until harvest status and tomato readiness are known."
 
     reasons = []
@@ -584,16 +584,16 @@ def format_farmer_report(result: Dict[str, Any]) -> str:
         transport_advice += f" Lowest forecast rain probability is on {transport['date_with_lowest_rain_probability']} ({transport.get('rain_probability_percent')}%)."
 
     lines = [
-        f"📍 Location: {location}",
+        f"Location: {location}",
         "",
-        "🌤 Weather Today",
+        " Weather Today",
         f"Temperature: {weather.get('temperature_c', 'N/A')}°C",
         f"Humidity: {weather.get('humidity_percent', 'N/A')}%",
         "",
-        "🌧 Rain Outlook",
+        " Rain Outlook",
         f"Rain probability tomorrow: {rain_text}",
         "",
-        "🍅 Tomato Market Advice",
+        " Tomato Market Advice",
         "",
         decision,
         "",
@@ -602,13 +602,13 @@ def format_farmer_report(result: Dict[str, Any]) -> str:
     lines.extend(f"• {reason}" for reason in reasons)
     lines.extend([
         "",
-        "📦 Storage Advice",
+        "Storage Advice",
         storage_advice,
         "",
-        "🚚 Transport Advice",
+        "Transport Advice",
         transport_advice,
         "",
-        "🕒 Suggested Sale Window",
+        "Suggested Sale Window",
         sale_window,
         "",
         f"Weather/handling screening: {risk_level} (heuristic indicator, not a scientifically validated spoilage prediction).",
