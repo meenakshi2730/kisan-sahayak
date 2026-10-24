@@ -1,23 +1,25 @@
 
 """
 Kisan Sahayak - Transport Agent
-
-Responsibilities:
-- Estimate road distance and travel time to candidate mandis.
-- Estimate transport and loading costs.
-- Account for quantity and truck capacity.
-- Respond using Fetch.ai's Agent Chat Protocol (ACP).
-
-Requests must contain JSON inside the ChatMessage text.
-Coordinates enable live road-route lookup through OSRM.
-If routing fails, an explicitly supplied distance_km can be used as a fallback.
+Estimates road distance, travel time, and transport costs.
+Uses Fetch.ai Chat Protocol with JSON requests and responses.
 """
 
+import asyncio
 import json
 import math
-from typing import Any, Dict, Optional
+import os
+import sys
+from typing import Any, Dict
+
+# Configure Windows event loop BEFORE importing uagents.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(
+        asyncio.WindowsSelectorEventLoopPolicy()
+    )
 
 import requests
+from dotenv import load_dotenv
 from uagents import Agent, Context, Protocol
 from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement,
@@ -26,9 +28,10 @@ from uagents_core.contrib.protocols.chat import (
     chat_protocol_spec,
 )
 
+load_dotenv()
 
 # ---------------------------------------------------------
-# CONFIGURATION: illustrative defaults; verify locally
+# CONFIGURATION
 # ---------------------------------------------------------
 
 DEFAULT_TRUCK_CAPACITY_QUINTALS = 100.0
@@ -36,7 +39,29 @@ DEFAULT_COST_PER_KM_PER_TRUCK = 35.0
 DEFAULT_LOADING_COST_PER_TRUCK = 500.0
 DEFAULT_AVERAGE_SPEED_KMPH = 30.0
 
-OSRM_BASE_URL = "https://router.project-osrm.org/route/v1/driving"
+OSRM_BASE_URL = (
+    "https://router.project-osrm.org/route/v1/driving"
+)
+
+# Create and set an explicit event loop for this agent.
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
+# Use a separate port from the Orchestrator and Price Agent.
+transport_seed = os.getenv("KISAN_TRANSPORT_SEED")
+if not transport_seed:
+    raise RuntimeError("Set KISAN_TRANSPORT_SEED in the root .env file.")
+
+agent_kwargs = {
+    "name": "kisan-sahayak-transport-agent",
+    "seed": transport_seed,
+    "port": 8002,
+    "endpoint": ["http://127.0.0.1:8002/submit"],
+    "loop": loop,
+}
+
+agent = Agent(**agent_kwargs)
+chat_protocol = Protocol(spec=chat_protocol_spec)
 
 
 # ---------------------------------------------------------
@@ -47,12 +72,7 @@ def get_route(
     origin: Dict[str, Any],
     destination: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Get road distance and driving duration from OSRM.
-
-    Coordinates must be decimal latitude/longitude.
-    OSRM expects longitude,latitude in its URL.
-    """
+    """Get a road route or use a caller-supplied distance."""
 
     required = ("latitude", "longitude")
 
@@ -76,19 +96,27 @@ def get_route(
                 (origin_lat, origin_lon),
                 (dest_lat, dest_lon),
             ):
-                if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-                    raise ValueError("Invalid latitude or longitude.")
+                if not (
+                    -90 <= lat <= 90
+                    and -180 <= lon <= 180
+                ):
+                    raise ValueError(
+                        "Invalid latitude or longitude."
+                    )
 
             url = (
                 f"{OSRM_BASE_URL}/"
-                f"{origin_lon},{origin_lat};{dest_lon},{dest_lat}"
+                f"{origin_lon},{origin_lat};"
+                f"{dest_lon},{dest_lat}"
             )
 
             response = requests.get(
                 url,
                 params={"overview": "false"},
                 timeout=6,
-                headers={"User-Agent": "KisanSahayak-TransportAgent/1.0"},
+                headers={
+                    "User-Agent": "KisanSahayak-TransportAgent/1.0"
+                },
             )
             response.raise_for_status()
             data = response.json()
@@ -97,30 +125,47 @@ def get_route(
                 route = data["routes"][0]
 
                 return {
-                    "distance_km": round(route["distance"] / 1000, 2),
-                    "travel_time_minutes": round(route["duration"] / 60),
+                    "distance_km": round(
+                        route["distance"] / 1000, 2
+                    ),
+                    "travel_time_minutes": round(
+                        route["duration"] / 60
+                    ),
                     "distance_source": "OSRM road-route estimate",
                     "route_available": True,
                 }
 
-        except (requests.RequestException, ValueError, KeyError, TypeError):
-            # If live routing fails, try the supplied distance below.
+        except (
+            requests.RequestException,
+            ValueError,
+            KeyError,
+            TypeError,
+        ):
             pass
 
-    # Fallback is allowed only when the caller supplies a distance.
+    # Only use a fallback when the caller supplies a distance.
     if destination.get("distance_km") is not None:
         try:
             distance_km = float(destination["distance_km"])
 
-            if not math.isfinite(distance_km) or distance_km < 0:
-                raise ValueError("distance_km must be a non-negative number.")
+            if (
+                not math.isfinite(distance_km)
+                or distance_km < 0
+            ):
+                raise ValueError(
+                    "distance_km must be non-negative."
+                )
 
             return {
                 "distance_km": round(distance_km, 2),
                 "travel_time_minutes": round(
-                    distance_km / DEFAULT_AVERAGE_SPEED_KMPH * 60
+                    distance_km
+                    / DEFAULT_AVERAGE_SPEED_KMPH
+                    * 60
                 ),
-                "distance_source": "Caller-supplied distance; not live routing",
+                "distance_source": (
+                    "Caller-supplied distance; not live routing"
+                ),
                 "route_available": True,
             }
 
@@ -146,27 +191,7 @@ def get_route(
 def calculate_transport(
     request_data: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Input example:
-    {
-        "origin": {
-            "name": "Kolar",
-            "latitude": 13.1367,
-            "longitude": 78.1292
-        },
-        "destinations": [
-            {
-                "name": "Example Mandi",
-                "latitude": 12.9716,
-                "longitude": 77.5946
-            }
-        ],
-        "quantity_quintals": 40,
-        "truck_capacity_quintals": 100,
-        "cost_per_km_per_truck": 35,
-        "loading_cost_per_truck": 500
-    }
-    """
+    """Calculate estimated transport costs for candidate mandis."""
 
     if not isinstance(request_data, dict):
         raise ValueError("The request must be a JSON object.")
@@ -174,7 +199,10 @@ def calculate_transport(
     origin = request_data.get("origin")
     destinations = request_data.get("destinations")
 
-    if not isinstance(origin, dict) or not isinstance(destinations, list):
+    if (
+        not isinstance(origin, dict)
+        or not isinstance(destinations, list)
+    ):
         raise ValueError(
             "Required fields: origin (object) and destinations (list)."
         )
@@ -182,7 +210,9 @@ def calculate_transport(
     if not destinations:
         raise ValueError("Provide at least one destination.")
 
-    quantity = float(request_data.get("quantity_quintals", 0))
+    quantity = float(
+        request_data.get("quantity_quintals", 0)
+    )
     truck_capacity = float(
         request_data.get(
             "truck_capacity_quintals",
@@ -202,34 +232,42 @@ def calculate_transport(
         )
     )
 
-    numeric_values = (quantity, truck_capacity, cost_per_km, loading_cost)
+    values = (
+        quantity,
+        truck_capacity,
+        cost_per_km,
+        loading_cost,
+    )
 
-    if not all(math.isfinite(value) for value in numeric_values):
-        raise ValueError("Numeric inputs must be finite numbers.")
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Numeric inputs must be finite.")
 
     if quantity <= 0:
-        raise ValueError("quantity_quintals must be greater than zero.")
+        raise ValueError(
+            "quantity_quintals must be greater than zero."
+        )
 
     if truck_capacity <= 0:
-        raise ValueError("truck_capacity_quintals must be greater than zero.")
+        raise ValueError(
+            "truck_capacity_quintals must be greater than zero."
+        )
 
     if cost_per_km < 0 or loading_cost < 0:
-        raise ValueError("Transport and loading costs cannot be negative.")
+        raise ValueError("Costs cannot be negative.")
 
-    # One or more trucks may be needed for the produce quantity.
     trucks_needed = math.ceil(quantity / truck_capacity)
-
     results = []
 
     for destination in destinations:
         if not isinstance(destination, dict):
             continue
 
-        name = str(destination.get("name", "Unnamed mandi"))
         route = get_route(origin, destination)
 
         result = {
-            "mandi": name,
+            "mandi": str(
+                destination.get("name", "Unnamed mandi")
+            ),
             "market_id": destination.get("market_id"),
             "origin": origin.get("name", "Farmer location"),
             "quantity_quintals": quantity,
@@ -239,16 +277,20 @@ def calculate_transport(
 
         if route["route_available"]:
             distance_km = route["distance_km"]
-
-            # One-way trip estimate. This does not assume a return trip.
-            transport_cost = distance_km * cost_per_km * trucks_needed
-            total_loading_cost = loading_cost * trucks_needed
+            transport_cost = (
+                distance_km * cost_per_km * trucks_needed
+            )
+            total_loading_cost = (
+                loading_cost * trucks_needed
+            )
 
             result.update({
                 "cost_per_km_per_truck": cost_per_km,
                 "loading_cost_per_truck": loading_cost,
                 "transport_cost": round(transport_cost, 2),
-                "total_loading_cost": round(total_loading_cost, 2),
+                "total_loading_cost": round(
+                    total_loading_cost, 2
+                ),
                 "estimated_total_cost": round(
                     transport_cost + total_loading_cost, 2
                 ),
@@ -268,11 +310,11 @@ def calculate_transport(
         results.append(result)
 
     valid_results = [
-        item for item in results
+        item
+        for item in results
         if item["estimated_total_cost"] is not None
     ]
 
-    # Rank by estimated transport cost, not overall mandi profitability.
     ranked_results = sorted(
         valid_results,
         key=lambda item: item["estimated_total_cost"],
@@ -283,7 +325,9 @@ def calculate_transport(
 
     return {
         "agent": "Kisan Sahayak Transport Agent",
-        "status": "success" if valid_results else "no_routes_available",
+        "status": (
+            "success" if valid_results else "no_routes_available"
+        ),
         "assumptions": {
             "truck_capacity_quintals": truck_capacity,
             "cost_per_km_per_truck": cost_per_km,
@@ -300,100 +344,58 @@ def calculate_transport(
         "warning": (
             "Estimates are not confirmed transporter quotes. "
             "Travel time excludes traffic and loading delays. "
-            "The lowest transport cost does not necessarily mean "
-            "the highest farmer profit."
+            "Lowest transport cost does not necessarily mean "
+            "highest farmer profit."
         ),
     }
 
 
 # ---------------------------------------------------------
-# FETCH.AI AGENT AND CHAT PROTOCOL
+# CHAT PROTOCOL HANDLERS
 # ---------------------------------------------------------
 
-agent = Agent()
-chat_protocol = Protocol(spec=chat_protocol_spec)
-
-
 def extract_text(message: ChatMessage) -> str:
-    """Collect text blocks from an incoming chat message."""
+    """Extract text blocks from a ChatMessage."""
 
-    parts = [
+    return "\n".join(
         item.text
         for item in message.content
         if isinstance(item, TextContent)
-    ]
-    return "\n".join(parts).strip()
+    ).strip()
 
 
 @chat_protocol.on_message(ChatMessage)
-async def handle_transport_request(
-    ctx: Context,
-    sender: str,
-    msg: ChatMessage,
-):
-    """Accept a JSON request and return one JSON response."""
+async def handle_transport_request(ctx: Context, sender: str, msg: ChatMessage):
+    await ctx.send(sender, ChatAcknowledgement(acknowledged_msg_id=msg.msg_id))
 
-    # Acknowledge receipt of the original request.
-    await ctx.send(
-        sender,
-        ChatAcknowledgement(acknowledged_msg_id=msg.msg_id),
-    )
-
-    text = extract_text(msg)
-
+    request_id = None
     try:
-        if not text:
+        message_text = extract_text(msg)
+        if not message_text:
             raise ValueError("Message is empty.")
 
-        request_data = json.loads(text)
-
+        request_data = json.loads(message_text)
         if not isinstance(request_data, dict):
             raise ValueError("Send a JSON object, not a JSON list.")
 
+        request_id = request_data.get("request_id")
         result = calculate_transport(request_data)
-
+        result["request_id"] = request_id
         response_text = json.dumps(result, ensure_ascii=False)
 
     except (json.JSONDecodeError, ValueError, TypeError, OverflowError) as exc:
         response_text = json.dumps({
             "agent": "Kisan Sahayak Transport Agent",
             "status": "error",
+            "request_id": request_id,
             "message": str(exc),
-            "expected_request_example": {
-                "origin": {
-                    "name": "Kolar",
-                    "latitude": 13.1367,
-                    "longitude": 78.1292,
-                },
-                "destinations": [
-                    {
-                        "name": "Bengaluru example",
-                        "latitude": 12.9716,
-                        "longitude": 77.5946,
-                    },
-                    {
-                        "name": "Mandi with supplied distance",
-                        "distance_km": 65,
-                    },
-                ],
-                "quantity_quintals": 40,
-                "truck_capacity_quintals": 100,
-                "cost_per_km_per_truck": 35,
-                "loading_cost_per_truck": 500,
-            },
         }, ensure_ascii=False)
 
     await ctx.send(
         sender,
-        ChatMessage(
-            content=[
-                TextContent(type="text", text=response_text)
-            ]
-        ),
+        ChatMessage(content=[TextContent(type="text", text=response_text)]),
     )
-
     ctx.logger.info("Transport request processed.")
-
 
 @chat_protocol.on_message(ChatAcknowledgement)
 async def handle_acknowledgement(
@@ -404,12 +406,8 @@ async def handle_acknowledgement(
     ctx.logger.info(f"Message acknowledged by {sender}")
 
 
-# Publish the Chat Protocol manifest for discovery.
 agent.include(chat_protocol, publish_manifest=True)
 
 
-# Local execution only.
-# When pasting into an Agentverse hosted-agent editor, remove this block:
-# Agentverse runs hosted agents for you.
 if __name__ == "__main__":
     agent.run()
