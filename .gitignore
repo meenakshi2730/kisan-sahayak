@@ -220,3 +220,15 @@ __marimo__/
 .streamlit/secrets.toml
 
 private_keys.json
+
+weather_cache.json
+price_cache.json
+
+.env
+private_keys.json
+weather_cache.json
+price_cache.json
+__pycache__/
+.venv/
+orchestrator.backup.py
+requirements.backup.txt
