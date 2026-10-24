@@ -1,12 +1,8 @@
 """
-Kisan Sahayak - Tomato Weather Agent (HOSTED on Agentverse)
-Fetches current weather and a three-day forecast.
-Spoilage risk is a heuristic, not a validated prediction.
-Forecasts are cached in ctx.storage so rate limits (429) and restarts do not break the agent.
-
-Hosted-agent notes:
-  * Paste this whole file into the agent's Build tab (agent.py). Do not call agent.run().
-  * No .env, no seed, no port, no cache file. No Secrets are required.
+Kisan Sahayak - Tomato Weather Agent
+Hosted on Agentverse.
+Provides current weather, a three-day forecast, and heuristic
+tomato spoilage-risk screening.
 """
 
 import asyncio
@@ -17,6 +13,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 import requests
+
 from uagents import Agent, Context, Protocol
 from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement,
@@ -42,42 +39,99 @@ LOCATIONS = {
     "channapatna, karnataka": (12.6514, 77.2067),
 }
 
+FRESH_S = 3600
+STALE_S = 43200
+
 agent = Agent()
 chat_protocol = Protocol(spec=chat_protocol_spec)
 
-FRESH_S = 3600      # reuse a forecast for 1 hour
-STALE_S = 43200     # if the API fails, reuse one up to 12 hours old
+
+# --------------------------------------------------
+# CHAT HELPERS
+# --------------------------------------------------
+
+def create_message(text):
+    return ChatMessage(
+        timestamp=datetime.now(timezone.utc),
+        msg_id=uuid4(),
+        content=[TextContent(type="text", text=text)],
+    )
 
 
-def load_cache(ctx: Context) -> dict:
+def extract_text(msg):
+    return "\n".join(
+        item.text
+        for item in msg.content
+        if isinstance(item, TextContent)
+    ).strip()
+
+
+async def send_json(ctx, sender, data):
+    await ctx.send(
+        sender,
+        create_message(json.dumps(data, ensure_ascii=False)),
+    )
+
+
+async def acknowledge_message(ctx, sender, msg):
+    try:
+        await ctx.send(
+            sender,
+            ChatAcknowledgement(
+                timestamp=datetime.now(timezone.utc),
+                acknowledged_msg_id=msg.msg_id,
+            ),
+        )
+    except Exception as exc:
+        ctx.logger.warning(f"Acknowledgement failed: {exc}")
+
+
+# --------------------------------------------------
+# CACHE
+# --------------------------------------------------
+
+def load_cache(ctx):
     try:
         raw = ctx.storage.get("weather_cache")
-        return json.loads(raw) if raw else {}
-    except Exception:
+        cache = json.loads(raw) if raw else {}
+        return cache if isinstance(cache, dict) else {}
+    except Exception as exc:
+        ctx.logger.warning(f"Could not load weather cache: {exc}")
         return {}
 
 
-def save_cache(ctx: Context, mem: dict) -> None:
+def save_cache(ctx, cache):
     try:
-        # keep only fresh-enough entries so storage stays small
-        keep = {k: v for k, v in mem.items() if time.time() - v.get("t", 0) < STALE_S}
-        ctx.storage.set("weather_cache", json.dumps(keep))
-    except Exception:
-        pass
+        now = time.time()
+        cleaned = {
+            key: value
+            for key, value in cache.items()
+            if isinstance(value, dict)
+            and now - value.get("t", 0) < STALE_S
+        }
+        ctx.storage.set("weather_cache", json.dumps(cleaned))
+    except Exception as exc:
+        ctx.logger.warning(f"Could not save weather cache: {exc}")
 
 
 # --------------------------------------------------
 # WEATHER API
 # --------------------------------------------------
 
-def get_weather(mem, latitude, longitude):
+def get_weather(cache, latitude, longitude):
     key = f"{latitude:.3f},{longitude:.3f}"
     now = time.time()
-    hit = mem.get(key)
-    if hit and now - hit["t"] < FRESH_S:
-        return hit["data"]
+    cached = cache.get(key)
 
-    last_err = None
+    if (
+        isinstance(cached, dict)
+        and "data" in cached
+        and now - cached.get("t", 0) < FRESH_S
+    ):
+        return cached["data"]
+
+    last_error = "Unknown weather API error"
+
     for attempt in range(2):
         try:
             response = requests.get(
@@ -85,7 +139,9 @@ def get_weather(mem, latitude, longitude):
                 params={
                     "latitude": latitude,
                     "longitude": longitude,
-                    "current": "temperature_2m,relative_humidity_2m,precipitation",
+                    "current": (
+                        "temperature_2m,relative_humidity_2m,precipitation"
+                    ),
                     "daily": (
                         "temperature_2m_max,temperature_2m_min,"
                         "precipitation_sum,precipitation_probability_max"
@@ -96,32 +152,47 @@ def get_weather(mem, latitude, longitude):
                 timeout=15,
                 headers={"User-Agent": "KisanSahayak/1.0"},
             )
+
             if response.status_code == 429:
-                last_err = "429 Too Many Requests"
+                last_error = "Weather API rate limit reached (429)"
                 time.sleep(1 + attempt)
                 continue
+
             response.raise_for_status()
             data = response.json()
+
             if "current" not in data or "daily" not in data:
-                raise ValueError("Weather provider returned incomplete data.")
-            mem[key] = {"t": now, "data": data}
+                raise ValueError("Weather API returned incomplete data.")
+
+            cache[key] = {"t": time.time(), "data": data}
             return data
-        except requests.RequestException as exc:
-            last_err = str(exc)
-            time.sleep(1 + attempt)
 
-    if hit and now - hit["t"] < STALE_S:
-        data = dict(hit["data"])
-        data["_stale"] = True          # an old forecast beats none
-        return data
-    raise requests.RequestException(f"Weather provider unavailable: {last_err}")
+        except (
+            requests.RequestException,
+            ValueError,
+        ) as exc:
+            last_error = str(exc)
+            if attempt == 0:
+                time.sleep(1)
+
+    # Return a recent cached forecast if the API is unavailable.
+    if (
+        isinstance(cached, dict)
+        and "data" in cached
+        and now - cached.get("t", 0) < STALE_S
+    ):
+        stale_data = dict(cached["data"])
+        stale_data["_stale"] = True
+        return stale_data
+
+    raise RuntimeError(f"Weather data unavailable: {last_error}")
 
 
 # --------------------------------------------------
-# PROCESS REQUEST
+# WEATHER PROCESSING
 # --------------------------------------------------
 
-def process_weather_request(request_data, mem):
+def process_weather_request(request_data, cache):
     if not isinstance(request_data, dict):
         raise ValueError("Request must be a JSON object.")
 
@@ -129,15 +200,13 @@ def process_weather_request(request_data, mem):
         request_data.get("crop_type", request_data.get("crop", "tomato"))
     ).strip().lower()
 
-    if crop not in ("tomato", "tomatoes"):
+    if crop not in {"tomato", "tomatoes"}:
         raise ValueError("This agent supports tomatoes only.")
 
     location = str(request_data.get("location", "Bengaluru")).strip()
 
     if not location:
         raise ValueError("Location cannot be empty.")
-
-    location_key = location.lower()
 
     has_lat = request_data.get("latitude") not in (None, "")
     has_lon = request_data.get("longitude") not in (None, "")
@@ -146,8 +215,11 @@ def process_weather_request(request_data, mem):
         raise ValueError("Provide both latitude and longitude.")
 
     if has_lat and has_lon:
-        latitude = float(request_data["latitude"])
-        longitude = float(request_data["longitude"])
+        try:
+            latitude = float(request_data["latitude"])
+            longitude = float(request_data["longitude"])
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("Coordinates must be valid numbers.")
 
         if not math.isfinite(latitude) or not -90 <= latitude <= 90:
             raise ValueError("Latitude must be between -90 and 90.")
@@ -155,14 +227,17 @@ def process_weather_request(request_data, mem):
         if not math.isfinite(longitude) or not -180 <= longitude <= 180:
             raise ValueError("Longitude must be between -180 and 180.")
     else:
+        location_key = location.lower()
+
         if location_key not in LOCATIONS:
             raise ValueError(
-                "Location must be Bengaluru, Kolar, Ramanagara, "
-                "or Channapatna, or provide latitude and longitude."
+                "Supported locations: Bengaluru, Kolar, Ramanagara, "
+                "and Channapatna. Alternatively, provide coordinates."
             )
+
         latitude, longitude = LOCATIONS[location_key]
 
-    data = get_weather(mem, latitude, longitude)
+    data = get_weather(cache, latitude, longitude)
     current = data["current"]
     daily = data["daily"]
 
@@ -173,9 +248,14 @@ def process_weather_request(request_data, mem):
     rain_probs = daily.get("precipitation_probability_max") or []
     rain_amounts = daily.get("precipitation_sum") or []
     max_temps = daily.get("temperature_2m_max") or []
+    dates = daily.get("time") or []
 
-    valid_rain = [float(v) for v in rain_probs if v is not None]
-    valid_temps = [float(v) for v in max_temps if v is not None]
+    valid_rain = [
+        float(value) for value in rain_probs if value is not None
+    ]
+    valid_temps = [
+        float(value) for value in max_temps if value is not None
+    ]
 
     score = 0
     factors = []
@@ -202,19 +282,27 @@ def process_weather_request(request_data, mem):
         factors.append("Very hot daytime temperatures are forecast.")
 
     if valid_rain and max(valid_rain) >= 70:
-        factors.append(f"Forecast rain probability reaches {max(valid_rain):.0f}%.")
+        factors.append(
+            f"Forecast rain probability reaches {max(valid_rain):.0f}%."
+        )
         actions.append("Arrange covered transport if selling during rain.")
     elif valid_rain and max(valid_rain) >= 40:
         factors.append("Rain is possible during the forecast.")
         actions.append("Check the forecast before transporting tomatoes.")
 
-    condition = str(request_data.get("crop_condition", "")).strip().lower()
+    condition = str(
+        request_data.get("crop_condition", "")
+    ).strip().lower()
 
-    if condition in {"damaged", "bruised", "overripe", "spoiling", "spoiled"}:
+    if condition in {
+        "damaged", "bruised", "overripe", "spoiling", "spoiled"
+    }:
         score += 2
         factors.append("Tomatoes are reported as damaged or deteriorating.")
         actions.append("Sort tomatoes and separate damaged produce.")
-    elif condition in {"ripe", "fully ripe", "mature", "ready", "ready to sell"}:
+    elif condition in {
+        "ripe", "fully ripe", "mature", "ready", "ready to sell"
+    }:
         score += 1
         factors.append("Tomatoes are reported as ripe or ready to sell.")
     else:
@@ -228,15 +316,25 @@ def process_weather_request(request_data, mem):
         risk_level = "LOW"
 
     if not actions:
-        actions.append("Use clean handling, suitable storage, and regular quality checks.")
+        actions.append(
+            "Use clean handling, suitable storage, and regular quality checks."
+        )
 
     forecast = []
-    for i, day in enumerate(daily.get("time", [])):
+
+    for index, day in enumerate(dates):
         forecast.append({
             "date": day,
-            "maximum_temperature_c": max_temps[i] if i < len(max_temps) else None,
-            "rainfall_mm": rain_amounts[i] if i < len(rain_amounts) else None,
-            "rain_probability_percent": rain_probs[i] if i < len(rain_probs) else None,
+            "maximum_temperature_c": (
+                max_temps[index] if index < len(max_temps) else None
+            ),
+            "rainfall_mm": (
+                rain_amounts[index]
+                if index < len(rain_amounts) else None
+            ),
+            "rain_probability_percent": (
+                rain_probs[index] if index < len(rain_probs) else None
+            ),
         })
 
     high_rain_day = next(
@@ -251,12 +349,12 @@ def process_weather_request(request_data, mem):
     if high_rain_day:
         advice = (
             f"Rain probability is high on {high_rain_day['date']}. "
-            "Check crop readiness and confirmed market arrangements before travel."
+            "Check crop readiness and market arrangements before travel."
         )
     else:
         advice = (
-            "No day with at least 70% rain probability appears in this forecast. "
-            "Recheck weather and market arrangements before travel."
+            "No forecast day has a rain probability of 70% or more. "
+            "Recheck the weather and market arrangements before travel."
         )
 
     return {
@@ -279,36 +377,27 @@ def process_weather_request(request_data, mem):
             "recommended_actions": actions,
         },
         "farmer_advice": advice,
-        "data_source": "Open-Meteo (cached forecast)" if data.get("_stale") else "Open-Meteo",
+        "data_source": (
+            "Open-Meteo cached forecast"
+            if data.get("_stale")
+            else "Open-Meteo"
+        ),
         "warning": (
-            "Heuristic weather and handling screening only; "
-            "not a validated spoilage probability or shelf-life prediction."
+            "Heuristic screening only; not a validated spoilage probability "
+            "or shelf-life prediction."
         ),
     }
 
 
 # --------------------------------------------------
-# CHAT HELPERS
-# --------------------------------------------------
-
-def extract_text(msg):
-    return "\n".join(
-        item.text for item in msg.content if isinstance(item, TextContent)
-    ).strip()
-
-
-# --------------------------------------------------
-# REQUEST HANDLER
+# CHAT MESSAGE HANDLER
 # --------------------------------------------------
 
 @chat_protocol.on_message(ChatMessage)
 async def handle_weather_request(ctx: Context, sender: str, msg: ChatMessage):
-    await ctx.send(
-        sender,
-        ChatAcknowledgement(
-            timestamp=datetime.now(timezone.utc), acknowledged_msg_id=msg.msg_id
-        ),
-    )
+    ctx.logger.info(f"Weather request received from {sender}")
+
+    await acknowledge_message(ctx, sender, msg)
 
     request_id = None
 
@@ -318,6 +407,21 @@ async def handle_weather_request(ctx: Context, sender: str, msg: ChatMessage):
         if not request_text:
             raise ValueError("Request message is empty.")
 
+        # Accept greetings as well as JSON requests.
+        if request_text.lower() in {
+            "hi", "hello", "hey", "namaste", "namaskara"
+        }:
+            await send_json(ctx, sender, {
+                "agent": "Kisan Sahayak Tomato Weather Agent",
+                "status": "success",
+                "request_id": None,
+                "message": (
+                    "Hello! I provide tomato weather forecasts and "
+                    "weather-based handling advice for supported locations."
+                ),
+            })
+            return
+
         request_data = json.loads(request_text)
 
         if not isinstance(request_data, dict):
@@ -325,16 +429,22 @@ async def handle_weather_request(ctx: Context, sender: str, msg: ChatMessage):
 
         request_id = request_data.get("request_id")
 
-        mem = load_cache(ctx)
-        # Keep blocking HTTP work outside the agent event loop.
-        result = await asyncio.to_thread(process_weather_request, request_data, mem)
-        save_cache(ctx, mem)
+        cache = load_cache(ctx)
+
+        result = await asyncio.to_thread(
+            process_weather_request,
+            request_data,
+            cache,
+        )
+
+        save_cache(ctx, cache)
 
     except (
         json.JSONDecodeError,
         ValueError,
         TypeError,
         OverflowError,
+        RuntimeError,
         requests.RequestException,
     ) as exc:
         result = {
@@ -344,30 +454,35 @@ async def handle_weather_request(ctx: Context, sender: str, msg: ChatMessage):
             "message": str(exc),
         }
 
-    except Exception:
-        ctx.logger.exception("Unexpected weather-agent error.")
+    except Exception as exc:
+        ctx.logger.exception(f"Unexpected weather error: {exc}")
+
         result = {
             "agent": "Kisan Sahayak Tomato Weather Agent",
             "status": "error",
             "request_id": request_id,
-            "message": "Unexpected internal error while processing weather.",
+            "message": "Unexpected internal weather processing error.",
         }
 
-    await ctx.send(
-        sender,
-        ChatMessage(
-            timestamp=datetime.now(timezone.utc),
-            msg_id=uuid4(),
-            content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False))],
-        ),
-    )
+    await send_json(ctx, sender, result)
+    ctx.logger.info(f"Weather request processed: {request_id}")
 
-    ctx.logger.info("Weather request processed. request_id=%s", request_id)
 
+# --------------------------------------------------
+# CHAT ACKNOWLEDGEMENT HANDLER
+# --------------------------------------------------
 
 @chat_protocol.on_message(ChatAcknowledgement)
-async def handle_acknowledgement(ctx: Context, sender: str, msg: ChatAcknowledgement):
-    ctx.logger.info("Message acknowledged by %s", sender)
+async def handle_acknowledgement(
+    ctx: Context,
+    sender: str,
+    msg: ChatAcknowledgement,
+):
+    ctx.logger.info(f"Chat acknowledgement received from {sender}")
 
+
+# --------------------------------------------------
+# REGISTER PROTOCOL
+# --------------------------------------------------
 
 agent.include(chat_protocol, publish_manifest=True)
