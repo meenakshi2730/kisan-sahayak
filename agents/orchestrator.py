@@ -12,7 +12,9 @@ import asyncio
 import json
 import math
 import os
+import queue
 import re
+import threading
 import sys
 import time
 from datetime import datetime, timezone
@@ -24,6 +26,7 @@ if sys.platform == "win32":
 import requests
 from dotenv import load_dotenv
 from uagents import Agent, Context, Protocol
+from uagents.crypto import Identity
 from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement,
     ChatMessage,
@@ -40,9 +43,21 @@ ASI_ONE_API_KEY = os.getenv("ASI_ONE_API_KEY", "").strip()
 ASI_MODEL = os.getenv("ASI_MODEL", "asi1").strip()
 ASI_ONE_URL = "https://api.asi1.ai/v1/chat/completions"
 
-PRICE_AGENT_ADDRESS = os.getenv("PRICE_AGENT_ADDRESS", "").strip()
-TRANSPORT_AGENT_ADDRESS = os.getenv("TRANSPORT_AGENT_ADDRESS", "").strip()
-WEATHER_AGENT_ADDRESS = os.getenv("WEATHER_AGENT_ADDRESS", "").strip()
+def agent_address(seed_var: str, addr_var: str) -> str:
+    """An agent's address is fixed by its seed. If the seed is in .env, derive the address from it, so a
+    stale or wrong *_AGENT_ADDRESS can never make the orchestrator message the wrong agent."""
+    seed = os.getenv(seed_var, "").strip()
+    addr = os.getenv(addr_var, "").strip()
+    if not seed:
+        return addr
+    derived = Identity.from_seed(seed, 0).address
+    if addr and addr != derived:
+        print(f"WARNING: {addr_var} in .env does not match {seed_var}. Using {derived} (derived from the seed).")
+    return derived
+
+PRICE_AGENT_ADDRESS = agent_address("KISAN_PRICE_SEED", "PRICE_AGENT_ADDRESS")
+TRANSPORT_AGENT_ADDRESS = agent_address("KISAN_TRANSPORT_SEED", "TRANSPORT_AGENT_ADDRESS")
+WEATHER_AGENT_ADDRESS = agent_address("KISAN_WEATHER_SEED", "WEATHER_AGENT_ADDRESS")
 AGENT_ADDRESSES = {a for a in (PRICE_AGENT_ADDRESS, TRANSPORT_AGENT_ADDRESS, WEATHER_AGENT_ADDRESS) if a}
 
 AGENT_TIMEOUT_S = float(os.getenv("AGENT_TIMEOUT_S", "30"))
@@ -85,7 +100,15 @@ def make_chat_message(text: str) -> ChatMessage:
     return ChatMessage(timestamp=datetime.now(timezone.utc), msg_id=uuid4(),
                        content=[TextContent(type="text", text=text)])
 
+LOCAL_USER = "local-terminal"      # the farmer typing in THIS terminal (CLI mode)
+CLI_MODE = os.getenv("CLI_MODE", "true").lower() == "true" and not HOSTED
+cli_inbox: "queue.Queue[str]" = queue.Queue()
+_cli_busy = False
+
 async def send_text(ctx: Context, to: str, text: str) -> None:
+    if to == LOCAL_USER:                       # print in the terminal instead of sending a message
+        print(f"\nKISAN SAHAYAK:\n{text}\n\nYou: ", end="", flush=True)
+        return
     await ctx.send(to, make_chat_message(text))
 
 def inr(x: float) -> str:
@@ -129,13 +152,21 @@ def get_pending(ctx: Context) -> list:
 def set_pending(ctx: Context, ids: list) -> None:
     ctx.storage.set("pending", json.dumps(ids))
 
-def load_partial(ctx: Context, user: str) -> dict:
-    raw = ctx.storage.get(f"partial:{user}")
-    data = json.loads(raw) if raw else {}
-    return data if data and time.time() - data.get("ts", 0) < 600 else {}
+CONV_TTL = 1800  # a conversation is remembered for 30 minutes
 
-def save_partial(ctx: Context, user: str, data: dict) -> None:
-    ctx.storage.set(f"partial:{user}", json.dumps({**data, "ts": time.time()}))
+def load_conv(ctx: Context, user: str) -> dict:
+    raw = ctx.storage.get(f"conv:{user}")
+    data = json.loads(raw) if raw else {}
+    if data and time.time() - data.get("ts", 0) > CONV_TTL:
+        return {}
+    return data
+
+def save_conv(ctx: Context, user: str, conv: dict) -> None:
+    conv["ts"] = time.time()
+    ctx.storage.set(f"conv:{user}", json.dumps(conv))
+
+def clear_conv(ctx: Context, user: str) -> None:
+    ctx.storage.set(f"conv:{user}", json.dumps({}))
 
 def normalize_location(value):
     if not value:
@@ -199,56 +230,243 @@ def parse_farmer_message(message: str) -> dict:
             out[k] = fb[k]
     return out
 
-def validate_request(p: dict):
-    """returns (clean_request | None, error_text | None, keep_partial)"""
-    crop = p.get("crop")
-    if crop and crop != "tomato":
-        return None, "Kisan Sahayak currently supports tomato only.", False
-    missing = []
-    if not crop:
-        missing.append("crop (tomato)")
-    loc = p.get("location")
-    if not loc:
-        missing.append("location (Bengaluru, Kolar, Ramanagara or Channapatna)")
-    q = p.get("quantity_quintals")
-    try:
-        q = float(q) if q is not None else None
-    except (TypeError, ValueError):
-        q = None
-    if q is None or isinstance(q, bool) or not math.isfinite(q) or not 0 < q <= 100000:
-        missing.append("quantity in quintals")
-    if missing:
-        return None, "I need a little more information. Please tell me your " + ", ".join(missing) + ".", True
-    return {"crop": "tomato", "location": loc, "quantity_quintals": q}, None, False
+# ------------------------------------------------------------------
+# CONVERSATION: the agent asks one question at a time, confirms, then runs
+#   crop -> quantity -> location -> condition -> confirm -> running -> idle
+# ------------------------------------------------------------------
+SLOT_ORDER = ["crop", "quantity_quintals", "location", "condition"]
+# Fewer questions for the farmer: by default only crop, quantity and location are needed.
+ASK_CONDITION = os.getenv("ASK_CONDITION", "false").lower() == "true"      # ask how the tomatoes look
+CONFIRM_BEFORE_RUN = os.getenv("CONFIRM_BEFORE_RUN", "false").lower() == "true"  # ask YES before running
+REQUIRED = SLOT_ORDER if ASK_CONDITION else SLOT_ORDER[:3]
+LOCATION_LIST = "Bengaluru, Kolar, Ramanagara or Channapatna"
+CONDITION_LABELS = {"fresh": "fresh and firm", "ripe": "ripe, ready to sell",
+                    "damaged": "some damaged or overripe", "not specified": "not specified"}
 
-WELCOME = ("Namaste! I am Kisan Sahayak. Tell me your crop, quantity and location, for example: "
-           "\"I have 40 quintal tomatoes in Kolar, where should I sell?\"")
+WELCOME = ("Namaste! I am Kisan Sahayak. I compare mandi prices, transport cost and weather risk "
+           "to tell you where you will earn the most from your tomatoes.")
+
+QUESTIONS = {
+    "crop": "Which crop would you like to sell? (Right now I can help with tomatoes.)",
+    "quantity_quintals": "How much tomato do you have? You can say quintals or kg (100 kg = 1 quintal).",
+    "both": (f"How much tomato do you have, and where is it? Example: \"40 quintal, Kolar\" "
+             f"(quintals or kg; I work with {LOCATION_LIST})."),
+    "location": f"Where are the tomatoes right now? I can work with {LOCATION_LIST}.",
+    "condition": ("How are your tomatoes at the moment?\n1. Fresh and firm\n2. Ripe, ready to sell\n"
+                  "3. Some are damaged or overripe\nReply 1, 2 or 3 (or say \"not sure\")."),
+}
+
+SLOT_KEYWORDS = {
+    "crop": ("crop",),
+    "quantity_quintals": ("quantity", "amount", "weight", "how much", "quintal", "kg"),
+    "location": ("location", "place", "town", "where", "city"),
+    "condition": ("condition", "quality", "ripe"),
+}
+
+YES_WORDS = {"yes", "y", "yeah", "yep", "ok", "okay", "sure", "haan", "ha", "han", "correct", "confirm",
+             "go", "proceed", "theek", "sahi", "right", "please", "ji", "sir", "now", "ahead", "it", "is", "that"}
+NO_WORDS = {"no", "n", "nope", "nahi", "nahin", "wrong", "change", "edit", "not", "correct"}
+GREETINGS = {"hi", "hello", "hey", "namaste", "namaskara", "namaskar", "hii", "helo", "start", "help"}
+
+def tokens(text: str) -> set:
+    return set(re.findall(r"\w+", text.lower()))
+
+def is_reset(low: str) -> bool:
+    return low in {"reset", "cancel", "restart", "new", "stop", "clear"} or "start over" in low \
+        or "start again" in low or "new request" in low
+
+def clean_qty(v):
+    try:
+        q = float(v)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(v, bool) or not math.isfinite(q) or not 0 < q <= 100000:
+        return None
+    return q
+
+def parse_condition(text: str, allow_digit: bool = True, allow_skip: bool = True):
+    low = text.lower().strip()
+    if allow_digit and re.fullmatch(r"[1-3]\.?", low):
+        return {"1": "fresh", "2": "ripe", "3": "damaged"}[low[0]]
+    if re.search(r"damag|bruis|over\s?ripe|spoil|rott|\brot\b|soft|split|crack", low):
+        return "damaged"
+    if re.search(r"\bripe\b|ready|\bred\b|pakka", low):
+        return "ripe"
+    if re.search(r"fresh|firm|green|just harvested|taaza|taza", low):
+        return "fresh"
+    if allow_skip and re.search(r"not sure|don.?t know|skip|unknown|no idea|pata nahi|any", low):
+        return "not specified"
+    return None
+
+def parse_step_answer(step: str, text: str):
+    """Interpret a short reply to the question we just asked."""
+    if step == "crop":
+        fb = fallback_parse(text)["crop"]
+        if fb:
+            return fb
+        return "tomato" if tokens(text) & YES_WORDS else None
+    if step == "quantity_quintals":
+        q = fallback_parse(text)["quantity_quintals"]
+        if q is None:
+            m = re.search(r"(\d+(?:\.\d+)?)", text)       # a bare number means quintals
+            q = float(m.group(1)) if m else None
+        return q
+    if step == "location":
+        return normalize_location(text)
+    if step == "condition":
+        return parse_condition(text)
+    return None
+
+def parse_free(message: str) -> dict:
+    out = parse_farmer_message(message)
+    out["condition"] = parse_condition(message, allow_digit=False, allow_skip=False)
+    return out
+
+def absorb(conv: dict, parsed: dict, overwrite: bool = False) -> list:
+    changed = []
+    for slot in SLOT_ORDER:
+        v = parsed.get(slot)
+        if slot == "quantity_quintals":
+            v = clean_qty(v)
+        if v and (overwrite or conv.get(slot) is None) and conv.get(slot) != v:
+            conv[slot] = v
+            changed.append(slot)
+    return changed
+
+def next_missing(conv: dict):
+    for slot in REQUIRED:
+        if conv.get(slot) is None:
+            return slot
+    return None
+
+def retry_text(slot: str, conv: dict) -> str:
+    if conv.get("quantity_quintals") is None and conv.get("location") is None and slot != "crop":
+        return "Sorry, I didn't catch that. " + QUESTIONS["both"]
+    if slot == "location":
+        return f"I can't check that place yet. Please choose one of: {LOCATION_LIST}."
+    return "Sorry, I didn't catch that. " + QUESTIONS[slot]
+
+def summary_text(conv: dict) -> str:
+    return ("Let me confirm what I have:\n"
+            f"- Crop: Tomato\n"
+            f"- Quantity: {conv['quantity_quintals']:g} quintal\n"
+            f"- Location: {conv['location'].title()}\n"
+            f"- Condition: {CONDITION_LABELS[conv.get('condition', 'not specified')]}\n\n"
+            "Shall I check mandi prices, transport and weather now? Reply YES to go, "
+            "or tell me what to change (for example \"60 quintals\" or \"Kolar\").")
+
+async def ask_next(ctx: Context, user: str, conv: dict, prefix: str = "") -> None:
+    slot = next_missing(conv)
+    if slot is None:
+        conv.setdefault("condition", "not specified")
+        if CONFIRM_BEFORE_RUN:
+            conv["step"] = "confirm"
+            save_conv(ctx, user, conv)
+            await send_text(ctx, user, prefix + summary_text(conv))
+        else:
+            await start_request(ctx, user, conv)       # everything known: go straight to the report
+        return
+    conv["step"] = slot
+    save_conv(ctx, user, conv)
+    both = slot == "quantity_quintals" and conv.get("location") is None
+    await send_text(ctx, user, prefix + QUESTIONS["both" if both else slot])
 
 async def handle_farmer(ctx: Context, sender: str, text: str) -> None:
-    parsed = await asyncio.to_thread(parse_farmer_message, text)
-    partial = load_partial(ctx, sender)
-    merged = {k: parsed.get(k) or partial.get(k) for k in ("crop", "location", "quantity_quintals")}
-    if not any(merged.values()):
-        await send_text(ctx, sender, WELCOME)
-        return
-    clean, err, keep = validate_request(merged)
-    if err:
-        save_partial(ctx, sender, merged if keep else {})
-        await send_text(ctx, sender, err)
-        return
-    save_partial(ctx, sender, {})
-    await start_request(ctx, sender, clean)
+    low = text.lower().strip()
+    words = tokens(text)
+    conv = load_conv(ctx, sender)
+    step = conv.get("step")
 
-async def start_request(ctx: Context, farmer: str, req: dict) -> None:
+    # 1. start over at any time
+    if is_reset(low):
+        await ask_next(ctx, sender, {}, "Okay, starting fresh.\n\n")
+        return
+
+    # 2. a request is already being processed
+    if step == "running":
+        st = load_state(ctx, conv["rid"]) if conv.get("rid") else None
+        if st and not st["done"]:
+            await send_text(ctx, sender, "I am still checking the mandis for you. Your report will arrive in a few seconds.")
+            return
+        step = conv["step"] = "idle"
+
+    # 3. a finished request: allow quick follow-ups like "what if 60 quintals?"
+    if step == "idle":
+        if not (words and words <= GREETINGS):
+            changed = absorb(conv, await asyncio.to_thread(parse_free, text), overwrite=True)
+            if changed:
+                await ask_next(ctx, sender, conv, "Sure, updating that. ")
+                return
+        conv, step = {}, None
+
+    # 4. confirmation / editing
+    if step in ("confirm", "edit"):
+        if step == "confirm" and words and words <= YES_WORDS and not (words & NO_WORDS - YES_WORDS):
+            await start_request(ctx, sender, conv)
+            return
+        if step == "confirm" and words and words <= NO_WORDS:
+            conv["step"] = "edit"
+            save_conv(ctx, sender, conv)
+            await send_text(ctx, sender, "No problem. What should I change: quantity, location or condition? "
+                                         "You can also just type the new value.")
+            return
+        changed = absorb(conv, await asyncio.to_thread(parse_free, text), overwrite=True)
+        if changed:
+            await ask_next(ctx, sender, conv, "Updated. ")
+            return
+        for slot, keys in SLOT_KEYWORDS.items():
+            if any(k in low for k in keys):
+                conv[slot] = None
+                await ask_next(ctx, sender, conv)
+                return
+        await send_text(ctx, sender, "Please reply YES to continue, or tell me what to change "
+                                     "(quantity, location or condition).")
+        return
+
+    # 5. greeting with nothing else
+    if not step and words and words <= GREETINGS:
+        await ask_next(ctx, sender, {}, WELCOME + "\n\n")
+        return
+
+    # 6. collecting details, one question at a time
+    parsed = {}
+    if step in SLOT_ORDER:
+        v = parse_step_answer(step, text)
+        if v is not None:
+            parsed[step] = v
+    if not parsed or len(text.split()) > 1:      # longer message: it may answer several questions
+        for k, v in (await asyncio.to_thread(parse_free, text)).items():
+            if v and not parsed.get(k):
+                parsed[k] = v
+    prefix = ""
+    if parsed.get("crop") == "other":
+        parsed.pop("crop")
+        prefix = "I can only help with tomatoes for now. "
+    changed = absorb(conv, parsed)
+    if not changed and not prefix:
+        if step in SLOT_ORDER:
+            conv["step"] = step
+            save_conv(ctx, sender, conv)
+            await send_text(ctx, sender, retry_text(step, conv))
+            return
+        prefix = WELCOME + "\n\n"
+    elif changed and not prefix:
+        prefix = "Got it. "
+    await ask_next(ctx, sender, conv, prefix)
+
+async def start_request(ctx: Context, farmer: str, conv: dict) -> None:
     rid = uuid4().hex[:8]
-    st = {"rid": rid, "farmer": farmer, "created": time.time(), "crop": req["crop"],
-          "location": req["location"], "qty": req["quantity_quintals"], "stage": "price", "done": False,
+    st = {"rid": rid, "farmer": farmer, "created": time.time(), "crop": "tomato",
+          "location": conv["location"], "qty": conv["quantity_quintals"],
+          "condition": conv.get("condition", "not specified"), "stage": "price", "done": False,
           "prices": None, "price_source": "", "transport": None, "weather": None,
           "transport_in": False, "weather_in": False, "warnings": [], "fanout_at": 0.0, "error": ""}
     save_state(ctx, st)
     set_pending(ctx, get_pending(ctx) + [rid])
-    ctx.logger.info(f"[{rid}] new request: {st['qty']:g} quintal tomato at {st['location']}")
-    await send_text(ctx, farmer, f"Checking prices, weather and transport for {st['qty']:g} quintal "
+    conv["step"], conv["rid"] = "running", rid
+    save_conv(ctx, farmer, conv)
+    ctx.logger.info(f"[{rid}] new request: {st['qty']:g} quintal tomato at {st['location']}, condition={st['condition']}")
+    await send_text(ctx, farmer, f"Thank you! Checking prices, weather and transport for {st['qty']:g} quintal "
                                  f"tomato near {st['location'].title()}. This takes up to {AGENT_TIMEOUT_S:.0f} seconds...")
     if not PRICE_AGENT_ADDRESS:
         st["error"] = "PRICE_AGENT_ADDRESS is not set in .env"
@@ -271,7 +489,8 @@ def normalize_prices(raw) -> list:
         except (KeyError, TypeError, ValueError):
             continue
         if name and per_q > 0:
-            out.append({"mandi": str(name), "price_per_quintal": per_q, "date": rec.get("observation_date", "")})
+            out.append({"mandi": str(name), "price_per_quintal": per_q, "date": rec.get("observation_date", ""),
+                        "source": rec.get("source", "")})
     return out
 
 async def handle_agent_reply(ctx: Context, sender: str, text: str) -> None:
@@ -326,7 +545,7 @@ async def on_price(ctx: Context, st: dict, data: dict) -> None:
         st["warnings"].append("TRANSPORT_AGENT_ADDRESS not set; transport costs are estimates.")
     if WEATHER_AGENT_ADDRESS:
         await send_text(ctx, WEATHER_AGENT_ADDRESS, json.dumps({
-            "request_id": rid, "crop_type": "tomato", "crop_condition": "not specified",
+            "request_id": rid, "crop_type": "tomato", "crop_condition": st.get("condition", "not specified"),
             "harvest_status": "unknown", "location": st["location"].title()}))
         ctx.logger.info(f"[{rid}] weather request sent")
     else:
@@ -361,8 +580,19 @@ async def on_weather(ctx: Context, st: dict, data: dict) -> None:
     risk = (data.get("spoilage_risk") or {}) if isinstance(data.get("spoilage_risk"), dict) else {}
     level = str(risk.get("level", "")).upper()
     if data.get("status") == "success" and level in RISK_TO_SPOILAGE:
+        cw = data.get("current_weather") if isinstance(data.get("current_weather"), dict) else {}
+        max_rain, rain_day = None, None
+        for day in (data.get("forecast_next_3_days") or []):
+            pr = day.get("rain_probability_percent") if isinstance(day, dict) else None
+            if isinstance(pr, (int, float)):
+                max_rain = pr if max_rain is None else max(max_rain, pr)
+                if pr >= 70 and rain_day is None:
+                    rain_day = day.get("date")
         st["weather"] = {"level": level, "fraction": RISK_TO_SPOILAGE[level],
-                         "advice": str(data.get("farmer_advice") or "")}
+                         "advice": str(data.get("farmer_advice") or ""),
+                         "temp": cw.get("temperature_c"), "humidity": cw.get("humidity_percent"),
+                         "max_rain": max_rain, "rain_day": rain_day,
+                         "actions": [str(x) for x in (risk.get("recommended_actions") or [])][:3]}
     else:
         st["warnings"].append("Weather data unavailable; assumed standard spoilage of "
                               f"{DEFAULT_SPOILAGE * 100:g}%.")
@@ -374,13 +604,20 @@ async def maybe_finish(ctx: Context, rid: str) -> None:
     if st and not st["done"] and st["transport_in"] and st["weather_in"]:
         await finalize(ctx, rid)
 
+def short_date(d) -> str:
+    try:
+        return datetime.strptime(str(d)[:10], "%Y-%m-%d").strftime("%d %b")
+    except ValueError:
+        return str(d)
+
 def compute_ranking(st: dict) -> list:
     qty = st["qty"]
     spoil = st["weather"]["fraction"] if st["weather"] else DEFAULT_SPOILAGE
     rows = []
     for p in st["prices"]:
         gross = p["price_per_quintal"] * qty
-        after = gross * (1 - spoil)
+        loss = gross * spoil
+        after = gross - loss
         t = (st["transport"] or {}).get(p["mandi"].lower())
         if t:
             tcost, dist, est = float(t["estimated_total_cost"]), t.get("distance_km"), False
@@ -388,25 +625,89 @@ def compute_ranking(st: dict) -> list:
             tcost, dist, est = DEFAULT_TRANSPORT_PER_QUINTAL * qty, None, True
         comm = after * COMMISSION_PCT
         rows.append({"mandi": p["mandi"], "price": p["price_per_quintal"], "transport": tcost,
-                     "distance_km": dist, "estimated": est, "spoilage": spoil, "commission": comm,
-                     "net": after - tcost - comm, "date": p.get("date", "")})
+                     "distance_km": dist, "estimated": est, "spoilage": spoil, "spoilage_loss": loss,
+                     "commission": comm, "net": after - tcost - comm, "date": p.get("date", ""),
+                     "source": p.get("source", "")})
     rows.sort(key=lambda r: r["net"], reverse=True)
     return rows
 
+def timing_decision(st: dict):
+    """returns (headline, reasons): sell today / within 1-2 days / no rush, from weather + tomato condition"""
+    w, cond = st["weather"], st.get("condition")
+    reasons = []
+    if cond == "damaged":
+        head = "SELL TODAY"
+        reasons.append("Some tomatoes are already damaged or overripe, so they will lose value fast. Do not store them.")
+    elif not w:
+        head = "SELL AS SOON AS YOU CAN"
+        reasons.append("Weather data was not available. Tomatoes spoil quickly, so do not wait.")
+    elif w["level"] == "HIGH":
+        head = "SELL TODAY"
+        reasons.append("Spoilage risk is HIGH with this weather. Storing tomatoes now can cost you money.")
+    elif w["level"] == "MODERATE" or cond == "ripe":
+        head = "SELL WITHIN 1-2 DAYS"
+        reasons.append("Spoilage risk is moderate or the tomatoes are already ripe. Sell soon and store carefully until then.")
+    else:
+        head = "NO RUSH - SELL WITHIN 2-3 DAYS"
+        reasons.append("Spoilage risk is LOW. You can wait a day or two if needed, but I cannot predict price changes, so do not wait long.")
+    if w and w.get("rain_day"):
+        reasons.append(f"Heavy rain is likely on {short_date(w['rain_day'])}. Send the load before it, or use covered transport.")
+    elif w and w.get("max_rain") is not None and w["max_rain"] >= 40:
+        reasons.append("Some rain is possible in the next 3 days. Check the sky before you travel and cover the load.")
+    return head, reasons
+
 def format_report(st: dict, rows: list) -> str:
     best = rows[0]
-    lines = [f"KISAN SAHAYAK - TOMATO, {st['qty']:g} quintal from {st['location'].title()}", "",
-             f"Best option: {best['mandi']}. You would take home about {inr(best['net'])}.", "", "Options:"]
+    w = st["weather"]
+    head, reasons = timing_decision(st)
+    cond = CONDITION_LABELS.get(st.get("condition"), "not specified")
+    lines = ["KISAN SAHAYAK - TOMATO REPORT",
+             f"{st['qty']:g} quintal | {st['location'].title()} | condition: {cond}", "",
+             "FINAL DECISION",
+             f"Sell at: {best['mandi']}",
+             f"When:    {head}",
+             f"You take home: about {inr(best['net'])} (after transport, spoilage and commission)", ""]
+    lines += [f"- {r}" for r in reasons]
+    if best["source"] != "AGMARKNET":
+        lines.append(f"- The price for {best['mandi']} is a SAMPLE estimate, not a live price. "
+                     "Call the mandi to confirm before you travel.")
+    if len(rows) > 1 and best["net"] > 0 and (best["net"] - rows[1]["net"]) / best["net"] < 0.03:
+        lines.append(f"- Close call: {rows[1]['mandi']} is only {inr(best['net'] - rows[1]['net'])} behind. "
+                     "Choose whichever is easier to reach.")
+
+    lines += ["", "COMPARE MANDIS (money in your hand)"]
     for i, r in enumerate(rows[:3], 1):
         dist = f", {r['distance_km']:g} km" if r["distance_km"] is not None else ""
         est = " (estimated)" if r["estimated"] else ""
-        lines.append(f"{i}. {r['mandi']}: price {inr(r['price'])}/quintal, transport {inr(r['transport'])}{est}{dist}, "
-                     f"spoilage {r['spoilage'] * 100:g}%, net in hand {inr(r['net'])}")
-    if st["weather"]:
-        lines += ["", f"Weather spoilage risk: {st['weather']['level']}. {st['weather']['advice']}".strip()]
-    lines += ["", f"Assumptions: commission {COMMISSION_PCT * 100:g}% of sale value; spoilage from weather risk level."]
+        star = "  <- best" if i == 1 else ""
+        lines.append(f"{i}. {r['mandi']}: {inr(r['net'])}{star}")
+        lines.append(f"   price {inr(r['price'])}/quintal, transport {inr(r['transport'])}{est}{dist}")
+
+    lines += ["", "WEATHER AND SPOILAGE"]
+    if w:
+        now = []
+        if w.get("temp") is not None:
+            now.append(f"{w['temp']:g}\u00b0C")
+        if w.get("humidity") is not None:
+            now.append(f"{w['humidity']:g}% humidity")
+        lines.append("Now: " + ", ".join(now) if now else "Now: not available")
+        if w.get("max_rain") is not None:
+            lines.append(f"Rain chance (next 3 days): up to {w['max_rain']:g}%")
+        lines.append(f"Spoilage risk: {w['level']}. I assumed about {best['spoilage'] * 100:g}% loss, "
+                     f"roughly {inr(best['spoilage_loss'])} on this load.")
+    else:
+        lines.append(f"Weather data was not available. I assumed {DEFAULT_SPOILAGE * 100:g}% spoilage.")
+
+    tips = list(w["actions"]) if w else []
+    for tip in ("Keep tomatoes in shade, in ventilated crates. Do not stack them high.",
+                "Separate damaged or soft tomatoes before loading."):
+        if tip not in tips:
+            tips.append(tip)
+    lines += ["", "UNTIL YOU SELL"] + [f"- {t}" for t in tips[:4]]
+
+    lines += ["", f"Assumptions: commission {COMMISSION_PCT * 100:g}% of sale value; spoilage from the weather risk level."]
     if st["warnings"]:
-        lines += ["", "Please note:"] + [f"- {w}" for w in st["warnings"]]
+        lines += ["", "Please note:"] + [f"- {x}" for x in st["warnings"]]
     return "\n".join(lines)
 
 async def finalize(ctx: Context, rid: str) -> None:
@@ -421,7 +722,12 @@ async def finalize(ctx: Context, rid: str) -> None:
         text = f"Sorry, I could not get mandi prices right now ({st['error']}). Please try again in a few minutes."
     else:
         text = format_report(st, compute_ranking(st))
+    text += "\n\nWant to try a different quantity or place? Just tell me, for example \"what if I take 60 quintals?\""
     await send_text(ctx, st["farmer"], text)
+    conv = load_conv(ctx, st["farmer"])
+    if conv.get("rid") == rid:
+        conv["step"] = "idle"
+        save_conv(ctx, st["farmer"], conv)
     ctx.logger.info(f"[{rid}] final report sent to farmer")
 
 @chat_protocol.on_message(ChatMessage)
@@ -469,8 +775,39 @@ async def startup(ctx: Context):
     ctx.logger.info(f"Orchestrator address: {ctx.agent.address}")
     for name, addr in (("price", PRICE_AGENT_ADDRESS), ("transport", TRANSPORT_AGENT_ADDRESS),
                        ("weather", WEATHER_AGENT_ADDRESS)):
-        ctx.logger.info(f"{name:9s} agent address: {'set' if addr else 'MISSING - set it in .env'}")
+        ctx.logger.info(f"{name:9s} agent address: {addr or 'MISSING - set the seed or address in .env'}")
+    if CLI_MODE:
+        clear_conv(ctx, LOCAL_USER)
+        threading.Thread(target=_read_keyboard, daemon=True).start()
+        print("\n" + "=" * 55 + "\n KISAN SAHAYAK - type your answers here (reset = start over)\n" + "=" * 55)
+        await ask_next(ctx, LOCAL_USER, {}, WELCOME + "\n\n")
     ctx.logger.info("ASI1 parsing: " + ("on" if ASI_ONE_API_KEY and not ASI_ONE_API_KEY.startswith(('PASTE_', 'replace_')) else "off (rule-based)"))
+
+def _read_keyboard() -> None:
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            return
+        if line.strip():
+            cli_inbox.put(line.strip())
+
+@agent.on_interval(period=0.5)
+async def cli_poll(ctx: Context):
+    """Feeds what you type in this terminal into the same conversation logic used for chat messages."""
+    global _cli_busy
+    if not CLI_MODE or _cli_busy or cli_inbox.empty():
+        return
+    _cli_busy = True
+    try:
+        text = cli_inbox.get()
+        try:
+            await handle_farmer(ctx, LOCAL_USER, text)
+        except Exception:
+            ctx.logger.exception("cli error")
+            await send_text(ctx, LOCAL_USER, "Sorry, something went wrong. Please try again.")
+    finally:
+        _cli_busy = False
 
 agent.include(chat_protocol, publish_manifest=True)
 
