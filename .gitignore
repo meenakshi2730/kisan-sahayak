@@ -232,3 +232,8 @@ __pycache__/
 .venv/
 orchestrator.backup.py
 requirements.backup.txt
+
+agent1q*_data.json
+*-error.txt
+*-run.txt
+*_error_full.txt
