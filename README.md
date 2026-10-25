@@ -15,7 +15,7 @@ It helps farmers compare crop-selling options by bringing together available man
 
 - **GitHub Repository:** [https://github.com/meenakshi2730/kisan-sahayak](https://github.com/meenakshi2730/kisan-sahayak)
 - **ASI Shared Chat:** https://asi1.ai/chat/6adfa193-f909-42fe-833a-fc5b36117c7d
-- **Demo Video:** [Add your public demo video URL]
+- **Demo Video:** https://drive.google.com/file/d/1Gef96sPbjRRwg512rG9DWMaU_plcqEqA/view?usp=drivesdk
 
 ## 🤖 Deployed Agents
 
