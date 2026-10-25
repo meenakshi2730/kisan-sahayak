@@ -277,6 +277,24 @@ The deployed-agent table above should contain the exact public agent names, addr
 For evaluation, use the ASI shared chat URL and Agentverse profiles provided in the project submission.
 
 ---
+### 🚀 Live Demo
+
+Experience Kisan Sahayak — From Mandi to Money through our deployed ASI workflow.
+
+1.📊 Mandi Comparison
+
+The system compares available mandi prices, estimated transportation costs, and estimated take-home amounts to help farmers make informed selling decisions.
+<BR>
+<img width="409" height="448" alt="image" src="https://github.com/user-attachments/assets/a4dcab0c-b4e9-44bc-9f83-205c083ce117" /> 
+<BR>
+2.✅ Final Selling Decision
+
+For the demonstration request of 20 quintals of tomatoes near Bengaluru, the system recommends Binny Mill (FF&V) Bengaluru APMC based on the highest reported estimated take-home amount.
+<br>
+<img width="448" height="415" alt="image" src="https://github.com/user-attachments/assets/e91e2d3c-99b2-4e0f-96f8-bd42de0d322d" /> 
+<BR>
+
+---
 
 ## 🌱 Real-World Impact
 
