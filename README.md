@@ -278,7 +278,7 @@ For evaluation, use the ASI shared chat URL and Agentverse profiles provided in 
 
 ---
 ### 🚀 Live Demo
----
+
 Experience Kisan Sahayak — From Mandi to Money through our deployed ASI workflow.
 
 1.📊 Mandi Comparison
